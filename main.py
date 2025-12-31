@@ -8,7 +8,6 @@ import argparse
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
-from collections import defaultdict
 import resource
 
 DEFAULT_HERTZ = 100.0
@@ -69,7 +68,11 @@ class ProcStat:
         parser.add_argument('--kb', action='store_true', help='Show memory in kilobytes')
         parser.add_argument('--mb', action='store_true', help='Show memory in megabytes (default)')
         
-        args = parser.parse_args()
+        try:
+            args = parser.parse_args()
+        except SystemExit:
+            self.show_help()
+            sys.exit(0)
         
         if args.help:
             self.show_help()
@@ -334,6 +337,7 @@ Note: Some systems may require sudo/root privileges to read all process informat
             return None
     
     def read_process(self, pid: int, uptime: float, interval: float) -> Optional[ProcessInfo]:
+        _ = uptime  # Not used, keep for compatibility
         stat_path = f"/proc/{pid}/stat"
         try:
             with open(stat_path, 'r') as f:
@@ -404,10 +408,11 @@ Note: Some systems may require sudo/root privileges to read all process informat
                 if count >= self.thread_limit:
                     break
                 
-                if not entry.name.isdigit():
+                try:
+                    tid = int(entry.name)
+                except ValueError:
                     continue
                 
-                tid = int(entry.name)
                 if tid == pid:
                     continue
                 
@@ -421,6 +426,7 @@ Note: Some systems may require sudo/root privileges to read all process informat
         return threads
     
     def read_thread(self, pid: int, tid: int, uptime: float, interval: float) -> Optional[ProcessInfo]:
+        _ = uptime  # Not used, keep for compatibility
         stat_path = f"/proc/{pid}/task/{tid}/stat"
         try:
             with open(stat_path, 'r') as f:
@@ -496,11 +502,14 @@ Note: Some systems may require sudo/root privileges to read all process informat
                     if line.startswith('VmRSS:'):
                         parts = line.split()
                         if len(parts) >= 2:
-                            rss = int(parts[1])
-                            if self.use_mb:
-                                return rss / 1024.0
-                            return float(rss)
-        except (IOError, PermissionError, ValueError):
+                            try:
+                                rss = int(parts[1])
+                                if self.use_mb:
+                                    return rss / 1024.0
+                                return float(rss)
+                            except ValueError:
+                                return 0.0
+        except (IOError, PermissionError):
             pass
         
         return 0.0
@@ -524,7 +533,14 @@ Note: Some systems may require sudo/root privileges to read all process informat
             return f"[{self.sanitize_output(default_name)}]"
     
     def sanitize_output(self, text: str) -> str:
-        return ''.join(c if ord(c) >= 32 and ord(c) < 127 else '?' for c in text).strip()
+        # Keep only printable ASCII characters and some whitespace
+        result = []
+        for c in text:
+            if 32 <= ord(c) < 127 or c in '\t\n\r':
+                result.append(c)
+            else:
+                result.append('?')
+        return ''.join(result).strip()
     
     def truncate_string(self, text: str, max_length: int) -> str:
         if len(text) <= max_length:
@@ -547,17 +563,24 @@ Note: Some systems may require sudo/root privileges to read all process informat
         
         display_count = min(self.limit, len(processes))
         
-        if display_count < len(processes):
-            processes.sort(key=lambda x: (-getattr(x, sort_field), x.pid))
-            display_processes = processes[:display_count]
-        else:
-            processes.sort(key=lambda x: (-getattr(x, sort_field), x.pid))
-            display_processes = processes
+        # Sort processes
+        if sort_field == 'cpu':
+            processes.sort(key=lambda x: (-x.cpu, x.pid))
+        elif sort_field == 'mem':
+            processes.sort(key=lambda x: (-x.memory, x.pid))
+        elif sort_field == 'pid':
+            processes.sort(key=lambda x: x.pid)
+        elif sort_field == 'command':
+            processes.sort(key=lambda x: (x.command.lower(), x.pid))
+        elif sort_field == 'time':
+            processes.sort(key=lambda x: (-x.time, x.pid))
+        
+        display_processes = processes[:display_count]
         
         memory_unit = "MB" if self.use_mb else "KB"
         memory_label = f"MEM({memory_unit})"
         
-        print(f"{'PID':<6} {'CPU%':<6} {memory_label:<12} {'STATE':<6} {'COMMAND':<80}")
+        print(f"{'PID':<6} {'CPU%':<6} {memory_label:<12} {'STATE':<6} {'COMMAND'}")
         print("-" * 80)
         
         total_cpu = 0.0
