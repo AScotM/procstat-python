@@ -49,7 +49,7 @@ class ProcStat:
         self.previous_stats: Dict[str, Dict[str, float]] = {}
         self.previous_uptime: Optional[float] = None
         self.last_scan_time = 0.0
-        self.config = self.load_config()
+        self.initial_scan_complete = False
     
     def parse_arguments(self):
         parser = argparse.ArgumentParser(
@@ -91,29 +91,6 @@ class ProcStat:
             self.use_mb = False
         else:
             self.use_mb = True
-    
-    def load_config(self) -> Dict[str, str]:
-        config = {}
-        config_paths = [
-            f"/etc/procstat.conf",
-            f"{Path.home()}/.procstat.conf",
-            "./.procstat.conf"
-        ]
-        
-        for config_path in config_paths:
-            try:
-                if os.path.exists(config_path):
-                    with open(config_path, 'r') as f:
-                        for line in f:
-                            line = line.strip()
-                            if line and not line.startswith('#'):
-                                if '=' in line:
-                                    key, value = line.split('=', 1)
-                                    config[key.strip()] = value.strip()
-            except (IOError, PermissionError):
-                continue
-        
-        return config
     
     def check_privileges(self):
         if os.geteuid() != 0:
@@ -298,6 +275,9 @@ class ProcStat:
     
     def run_once(self):
         try:
+            if self.watch:
+                time.sleep(0.1)
+            
             uptime = self.get_uptime()
             self.previous_uptime = uptime
             self.last_scan_time = time.time()
@@ -318,8 +298,6 @@ class ProcStat:
             return
         
         current_scan_time = time.time()
-        interval = current_scan_time - self.last_scan_time if self.previous_uptime is not None else 1.0
-        self.last_scan_time = current_scan_time
         
         for pid in pids:
             proc_count += 1
@@ -329,15 +307,18 @@ class ProcStat:
                     sys.stderr.write(f"Warning: Too many processes, stopping scan at {proc_count}\n")
                 break
             
-            process_info = self.read_process(pid, uptime, interval)
+            process_info = self.read_process(pid, uptime)
             if process_info is not None:
                 processes.append(process_info)
                 
                 if self.threads:
-                    threads = self.read_threads(pid, uptime, interval)
+                    threads = self.read_threads(pid, uptime)
                     processes.extend(threads)
             else:
                 error_count += 1
+        
+        if not self.initial_scan_complete:
+            self.initial_scan_complete = True
         
         execution_time = (time.time() - start_time) * 1000
         
@@ -352,6 +333,7 @@ class ProcStat:
                 print(f"Note: {error_count} processes could not be read (permissions or terminated)")
         
         self.previous_uptime = uptime
+        self.last_scan_time = current_scan_time
     
     def scan_proc_directory(self) -> Optional[List[int]]:
         try:
@@ -363,7 +345,7 @@ class ProcStat:
         except (OSError, PermissionError):
             return None
     
-    def read_process(self, pid: int, uptime: float, interval: float) -> Optional[ProcessInfo]:
+    def read_process(self, pid: int, uptime: float) -> Optional[ProcessInfo]:
         stat_path = f"/proc/{pid}/stat"
         try:
             with open(stat_path, 'r') as f:
@@ -392,30 +374,38 @@ class ProcStat:
             stime = float(fields[12])
             cutime = float(fields[13])
             cstime = float(fields[14])
+            start_time = float(fields[21])
         except (IndexError, ValueError):
             return None
         
         total_time = utime + stime + cutime + cstime
+        current_time = time.time()
         
         previous_key = f"{pid}_process"
         previous_stat = self.previous_stats.get(previous_key)
         
-        if previous_stat:
+        cpu_usage = 0.0
+        
+        if previous_stat and self.initial_scan_complete:
             previous_total_time = previous_stat['total_time']
             previous_timestamp = previous_stat['timestamp']
-            actual_interval = time.time() - previous_timestamp
+            actual_interval = current_time - previous_timestamp
             
-            if actual_interval > 0:
+            if actual_interval > MIN_UPTIME:
                 time_diff_seconds = (total_time - previous_total_time) / self.hertz
                 cpu_usage = 100.0 * (time_diff_seconds / actual_interval)
-            else:
-                cpu_usage = 0.0
-        else:
-            cpu_usage = 0.0
+                if cpu_usage < 0:
+                    cpu_usage = 0.0
+        elif not self.watch or not self.initial_scan_complete:
+            process_start = start_time / self.hertz
+            process_lifetime = uptime - process_start
+            
+            if process_lifetime > MIN_UPTIME:
+                cpu_usage = 100.0 * (total_time / self.hertz) / process_lifetime
         
         self.previous_stats[previous_key] = {
             'total_time': total_time,
-            'timestamp': time.time()
+            'timestamp': current_time
         }
         
         memory = self.get_memory_usage(pid)
@@ -432,7 +422,7 @@ class ProcStat:
             ptype='process'
         )
     
-    def read_threads(self, pid: int, uptime: float, interval: float) -> List[ProcessInfo]:
+    def read_threads(self, pid: int, uptime: float) -> List[ProcessInfo]:
         threads = []
         task_dir = Path(f"/proc/{pid}/task")
         
@@ -453,7 +443,7 @@ class ProcStat:
                 if tid == pid:
                     continue
                 
-                thread = self.read_thread(pid, tid, uptime, interval)
+                thread = self.read_thread(pid, tid, uptime)
                 if thread is not None:
                     threads.append(thread)
                     count += 1
@@ -462,7 +452,7 @@ class ProcStat:
         
         return threads
     
-    def read_thread(self, pid: int, tid: int, uptime: float, interval: float) -> Optional[ProcessInfo]:
+    def read_thread(self, pid: int, tid: int, uptime: float) -> Optional[ProcessInfo]:
         stat_path = f"/proc/{pid}/task/{tid}/stat"
         try:
             with open(stat_path, 'r') as f:
@@ -478,37 +468,45 @@ class ProcStat:
         data = content[last_paren + 2:]
         fields = data.split()
         
-        if len(fields) < 14:
+        if len(fields) < 22:
             return None
         
         try:
             state = fields[0]
             utime = float(fields[11])
             stime = float(fields[12])
+            start_time = float(fields[21])
         except (IndexError, ValueError):
             return None
         
         total_time = utime + stime
+        current_time = time.time()
         
         previous_key = f"{pid}_{tid}_thread"
         previous_stat = self.previous_stats.get(previous_key)
         
-        if previous_stat:
+        cpu_usage = 0.0
+        
+        if previous_stat and self.initial_scan_complete:
             previous_total_time = previous_stat['total_time']
             previous_timestamp = previous_stat['timestamp']
-            actual_interval = time.time() - previous_timestamp
+            actual_interval = current_time - previous_timestamp
             
-            if actual_interval > 0:
+            if actual_interval > MIN_UPTIME:
                 time_diff_seconds = (total_time - previous_total_time) / self.hertz
                 cpu_usage = 100.0 * (time_diff_seconds / actual_interval)
-            else:
-                cpu_usage = 0.0
-        else:
-            cpu_usage = 0.0
+                if cpu_usage < 0:
+                    cpu_usage = 0.0
+        elif not self.watch or not self.initial_scan_complete:
+            process_start = start_time / self.hertz
+            process_lifetime = uptime - process_start
+            
+            if process_lifetime > MIN_UPTIME:
+                cpu_usage = 100.0 * (total_time / self.hertz) / process_lifetime
         
         self.previous_stats[previous_key] = {
             'total_time': total_time,
-            'timestamp': time.time()
+            'timestamp': current_time
         }
         
         memory = self.get_memory_usage(tid)
