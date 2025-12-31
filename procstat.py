@@ -7,7 +7,7 @@ import signal
 import argparse
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional
 import resource
 
 DEFAULT_HERTZ = 100.0
@@ -52,8 +52,7 @@ class ProcStat:
     def parse_arguments(self):
         parser = argparse.ArgumentParser(
             description='Process Monitor - Linux Process Statistics',
-            add_help=False,
-            formatter_class=argparse.RawDescriptionHelpFormatter
+            add_help=False
         )
         
         parser.add_argument('-h', '--help', action='store_true', help='Show this help message')
@@ -87,7 +86,12 @@ class ProcStat:
         self.threads = args.threads
         self.thread_limit = args.thread_limit
         self.max_pid_scan = args.max_scan
-        self.use_mb = not args.kb or args.mb
+        if args.mb:
+            self.use_mb = True
+        elif args.kb:
+            self.use_mb = False
+        else:
+            self.use_mb = True
     
     def validate_options(self):
         if self.sort not in VALID_SORTS:
@@ -114,7 +118,10 @@ class ProcStat:
         try:
             max_files = min(4096, self.max_pid_scan * 3)
             resource.setrlimit(resource.RLIMIT_NOFILE, (max_files, max_files))
-            
+        except (ValueError, resource.error):
+            pass
+        
+        try:
             max_time = 30
             resource.setrlimit(resource.RLIMIT_CPU, (max_time, max_time))
         except (ValueError, resource.error):
@@ -279,7 +286,7 @@ Note: Some systems may require sudo/root privileges to read all process informat
             print(f"Error: {e}")
             sys.exit(1)
     
-    def run_once_with_uptime(self, uptime: float):
+    def run_once_with_ptime(self, uptime: float):
         start_time = time.time()
         processes = []
         proc_count = 0
@@ -326,6 +333,10 @@ Note: Some systems may require sudo/root privileges to read all process informat
         
         self.previous_uptime = uptime
     
+    def run_once_with_uptime(self, uptime: float):
+        # Alias for backward compatibility
+        self.run_once_with_ptime(uptime)
+    
     def scan_proc_directory(self) -> Optional[List[int]]:
         try:
             pids = []
@@ -337,7 +348,7 @@ Note: Some systems may require sudo/root privileges to read all process informat
             return None
     
     def read_process(self, pid: int, uptime: float, interval: float) -> Optional[ProcessInfo]:
-        _ = uptime  # Not used, keep for compatibility
+        _ = uptime  # Not used
         stat_path = f"/proc/{pid}/stat"
         try:
             with open(stat_path, 'r') as f:
@@ -372,9 +383,21 @@ Note: Some systems may require sudo/root privileges to read all process informat
         total_time = utime + stime + cutime + cstime
         
         previous_key = f"{pid}_process"
-        previous_total_time = self.previous_stats.get(previous_key, {}).get('total_time', 0.0)
+        previous_stat = self.previous_stats.get(previous_key)
         
-        cpu_usage = self.calculate_cpu_usage(total_time, previous_total_time, interval)
+        if previous_stat:
+            previous_total_time = previous_stat['total_time']
+            previous_timestamp = previous_stat['timestamp']
+            actual_interval = time.time() - previous_timestamp
+            
+            if actual_interval > 0:
+                # Convert clock ticks to seconds, then calculate percentage
+                time_diff_seconds = (total_time - previous_total_time) / self.hertz
+                cpu_usage = 100.0 * (time_diff_seconds / actual_interval)
+            else:
+                cpu_usage = 0.0
+        else:
+            cpu_usage = 0.0
         
         self.previous_stats[previous_key] = {
             'total_time': total_time,
@@ -426,7 +449,7 @@ Note: Some systems may require sudo/root privileges to read all process informat
         return threads
     
     def read_thread(self, pid: int, tid: int, uptime: float, interval: float) -> Optional[ProcessInfo]:
-        _ = uptime  # Not used, keep for compatibility
+        _ = uptime  # Not used
         stat_path = f"/proc/{pid}/task/{tid}/stat"
         try:
             with open(stat_path, 'r') as f:
@@ -455,9 +478,21 @@ Note: Some systems may require sudo/root privileges to read all process informat
         total_time = utime + stime
         
         previous_key = f"{pid}_{tid}_thread"
-        previous_total_time = self.previous_stats.get(previous_key, {}).get('total_time', 0.0)
+        previous_stat = self.previous_stats.get(previous_key)
         
-        cpu_usage = self.calculate_cpu_usage(total_time, previous_total_time, interval)
+        if previous_stat:
+            previous_total_time = previous_stat['total_time']
+            previous_timestamp = previous_stat['timestamp']
+            actual_interval = time.time() - previous_timestamp
+            
+            if actual_interval > 0:
+                # Convert clock ticks to seconds, then calculate percentage
+                time_diff_seconds = (total_time - previous_total_time) / self.hertz
+                cpu_usage = 100.0 * (time_diff_seconds / actual_interval)
+            else:
+                cpu_usage = 0.0
+        else:
+            cpu_usage = 0.0
         
         self.previous_stats[previous_key] = {
             'total_time': total_time,
@@ -476,23 +511,6 @@ Note: Some systems may require sudo/root privileges to read all process informat
             ptime=round(total_time / self.hertz, 1),
             ptype='thread'
         )
-    
-    def calculate_cpu_usage(self, total_time: float, previous_total_time: float, interval: float) -> float:
-        if interval <= FLOAT_EPSILON:
-            return 0.0
-        
-        time_diff = total_time - previous_total_time
-        if time_diff < 0:
-            time_diff = 0.0
-        
-        cpu_usage = 100.0 * (time_diff / self.hertz) / interval
-        
-        if cpu_usage < 0.0:
-            return 0.0
-        if cpu_usage > 100.0:
-            return 100.0
-        
-        return cpu_usage
     
     def get_memory_usage(self, pid: int) -> float:
         status_path = f"/proc/{pid}/status"
@@ -523,17 +541,25 @@ Note: Some systems may require sudo/root privileges to read all process informat
             if not content:
                 return f"[{self.sanitize_output(default_name)}]"
             
-            cmdline = content.replace(b'\x00', b' ').decode('utf-8', errors='replace').strip()
+            parts = content.split(b'\x00')
+            cmd_parts = []
+            for part in parts:
+                if part:
+                    try:
+                        cmd_parts.append(part.decode('utf-8', errors='replace'))
+                    except UnicodeDecodeError:
+                        cmd_parts.append(part.decode('latin-1', errors='replace'))
+            
+            cmdline = ' '.join(cmd_parts).strip()
             if not cmdline:
                 return f"[{self.sanitize_output(default_name)}]"
             
             cmdline = self.sanitize_output(cmdline)
             return self.truncate_string(cmdline, DEFAULT_CMD_LENGTH)
-        except (IOError, PermissionError, UnicodeDecodeError):
+        except (IOError, PermissionError):
             return f"[{self.sanitize_output(default_name)}]"
     
     def sanitize_output(self, text: str) -> str:
-        # Keep only printable ASCII characters and some whitespace
         result = []
         for c in text:
             if 32 <= ord(c) < 127 or c in '\t\n\r':
@@ -554,27 +580,18 @@ Note: Some systems may require sudo/root privileges to read all process informat
                 print("Try running with sudo for more complete results.")
             return
         
-        sort_field = {
-            'mem': 'memory',
-            'pid': 'pid',
-            'command': 'command',
-            'time': 'time'
-        }.get(self.sort, 'cpu')
-        
-        display_count = min(self.limit, len(processes))
-        
-        # Sort processes
-        if sort_field == 'cpu':
+        if self.sort == 'cpu':
             processes.sort(key=lambda x: (-x.cpu, x.pid))
-        elif sort_field == 'mem':
+        elif self.sort == 'mem':
             processes.sort(key=lambda x: (-x.memory, x.pid))
-        elif sort_field == 'pid':
+        elif self.sort == 'pid':
             processes.sort(key=lambda x: x.pid)
-        elif sort_field == 'command':
+        elif self.sort == 'command':
             processes.sort(key=lambda x: (x.command.lower(), x.pid))
-        elif sort_field == 'time':
+        elif self.sort == 'time':
             processes.sort(key=lambda x: (-x.time, x.pid))
         
+        display_count = min(self.limit, len(processes))
         display_processes = processes[:display_count]
         
         memory_unit = "MB" if self.use_mb else "KB"
