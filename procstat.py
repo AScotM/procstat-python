@@ -7,7 +7,7 @@ import signal
 import argparse
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import resource
 
 DEFAULT_HERTZ = 100.0
@@ -39,6 +39,7 @@ class ProcStat:
             sys.exit(1)
         
         self.parse_arguments()
+        self.check_privileges()
         self.validate_proc_filesystem()
         self.hertz = self.detect_hertz()
         self.validate_options()
@@ -48,14 +49,14 @@ class ProcStat:
         self.previous_stats: Dict[str, Dict[str, float]] = {}
         self.previous_uptime: Optional[float] = None
         self.last_scan_time = 0.0
+        self.config = self.load_config()
     
     def parse_arguments(self):
         parser = argparse.ArgumentParser(
             description='Process Monitor - Linux Process Statistics',
-            add_help=False
+            add_help=True
         )
         
-        parser.add_argument('-h', '--help', action='store_true', help='Show this help message')
         parser.add_argument('--limit', type=int, default=DEFAULT_LIMIT, help='Show top N processes')
         parser.add_argument('--sort', type=str, default='cpu', help='Sort by: cpu, mem, pid, command, time')
         parser.add_argument('--watch', nargs='?', const=DEFAULT_INTERVAL, type=int, help='Refresh every N seconds')
@@ -66,15 +67,11 @@ class ProcStat:
         parser.add_argument('--max-scan', type=int, default=DEFAULT_MAX_PID_SCAN, help='Maximum PIDs to scan')
         parser.add_argument('--kb', action='store_true', help='Show memory in kilobytes')
         parser.add_argument('--mb', action='store_true', help='Show memory in megabytes (default)')
+        parser.add_argument('--vm-size', action='store_true', help='Use VmSize instead of VmRSS for memory')
         
         try:
             args = parser.parse_args()
         except SystemExit:
-            self.show_help()
-            sys.exit(0)
-        
-        if args.help:
-            self.show_help()
             sys.exit(0)
         
         self.limit = args.limit
@@ -86,12 +83,41 @@ class ProcStat:
         self.threads = args.threads
         self.thread_limit = args.thread_limit
         self.max_pid_scan = args.max_scan
+        self.use_vm_size = args.vm_size
+        
         if args.mb:
             self.use_mb = True
         elif args.kb:
             self.use_mb = False
         else:
             self.use_mb = True
+    
+    def load_config(self) -> Dict[str, str]:
+        config = {}
+        config_paths = [
+            f"/etc/procstat.conf",
+            f"{Path.home()}/.procstat.conf",
+            "./.procstat.conf"
+        ]
+        
+        for config_path in config_paths:
+            try:
+                if os.path.exists(config_path):
+                    with open(config_path, 'r') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line and not line.startswith('#'):
+                                if '=' in line:
+                                    key, value = line.split('=', 1)
+                                    config[key.strip()] = value.strip()
+            except (IOError, PermissionError):
+                continue
+        
+        return config
+    
+    def check_privileges(self):
+        if os.geteuid() != 0:
+            sys.stderr.write("Warning: Running without root privileges. Some processes may not be visible.\n")
     
     def validate_options(self):
         if self.sort not in VALID_SORTS:
@@ -116,16 +142,19 @@ class ProcStat:
     
     def setup_resource_limits(self):
         try:
-            max_files = min(4096, self.max_pid_scan * 3)
-            resource.setrlimit(resource.RLIMIT_NOFILE, (max_files, max_files))
-        except (ValueError, resource.error):
-            pass
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            max_files = min(self.max_pid_scan * 3, hard)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (max_files, hard))
+        except (ValueError, resource.error) as e:
+            if self.verbose:
+                sys.stderr.write(f"Debug: Could not set file limit: {e}\n")
         
         try:
             max_time = 30
             resource.setrlimit(resource.RLIMIT_CPU, (max_time, max_time))
-        except (ValueError, resource.error):
-            pass
+        except (ValueError, resource.error) as e:
+            if self.verbose:
+                sys.stderr.write(f"Debug: Could not set CPU limit: {e}\n")
     
     def validate_proc_filesystem(self):
         if not os.path.exists('/proc') or not os.path.isdir('/proc'):
@@ -153,6 +182,21 @@ class ProcStat:
             return uptime
         except (IOError, ValueError) as e:
             raise RuntimeError(f'Cannot read /proc/uptime: {e}')
+    
+    def format_uptime(self, uptime: float) -> str:
+        days = int(uptime // 86400)
+        hours = int((uptime % 86400) // 3600)
+        minutes = int((uptime % 3600) // 60)
+        seconds = int(uptime % 60)
+        
+        if days > 0:
+            return f"{days}d {hours}h {minutes}m"
+        elif hours > 0:
+            return f"{hours}h {minutes}m {seconds}s"
+        elif minutes > 0:
+            return f"{minutes}m {seconds}s"
+        else:
+            return f"{seconds}s"
     
     def detect_hertz(self) -> float:
         try:
@@ -184,34 +228,6 @@ class ProcStat:
         if self.verbose:
             sys.stderr.write(f"Debug: Using default HERTZ value: {DEFAULT_HERTZ}\n")
         return DEFAULT_HERTZ
-    
-    def show_help(self):
-        script_name = os.path.basename(sys.argv[0])
-        help_text = f"""Process Monitor - Linux Process Statistics
-Usage: {script_name} [OPTIONS]
-
-Options:
-  -h, --help            Show this help message
-      --limit=N         Show top N processes (default: 20)
-      --sort=TYPE       Sort by: cpu, mem, pid, command, time (default: cpu)
-      --watch[=N]       Refresh every N seconds (default: 2)
-      --verbose         Show debug information
-      --zombie          Include zombie processes
-      --threads         Show thread information
-      --thread-limit=N  Maximum threads per process (default: 1000)
-      --max-scan=N      Maximum PIDs to scan (default: 131072)
-      --kb              Show memory in kilobytes
-      --mb              Show memory in megabytes (default)
-
-Examples:
-  {script_name} --limit=10 --sort=mem
-  {script_name} --watch=5 --threads
-  {script_name} --verbose --zombie --kb
-  sudo {script_name} --limit=20 --sort=cpu
-
-Note: Some systems may require sudo/root privileges to read all process information.
-"""
-        print(help_text)
     
     def run(self):
         if self.watch:
@@ -261,18 +277,22 @@ Note: Some systems may require sudo/root privileges to read all process informat
     
     def display_header(self, iteration: int, uptime: float):
         memory_unit = "MB" if self.use_mb else "KB"
+        memory_type = "VmSize" if self.use_vm_size else "VmRSS"
+        uptime_str = self.format_uptime(uptime)
         
-        print(f"Process Monitor - Iteration #{iteration} - {time.strftime('%Y-%m-%d %H:%M:%S')} - Uptime: {uptime:.0f}s")
+        print(f"Process Monitor - Iteration #{iteration} - {time.strftime('%Y-%m-%d %H:%M:%S')} - Uptime: {uptime_str}")
         
         modes = []
         if self.zombie:
             modes.append('Zombies')
         if self.threads:
             modes.append('Threads')
+        if self.use_vm_size:
+            modes.append('VmSize')
         
         mode_str = f" | Modes: {', '.join(modes)}" if modes else ""
         
-        print(f"Sorting by: {self.sort.upper()} | Showing top: {self.limit} | Refresh: {self.interval}s | Memory: {memory_unit}{mode_str}")
+        print(f"Sorting by: {self.sort.upper()} | Showing top: {self.limit} | Refresh: {self.interval}s | Memory: {memory_unit} ({memory_type}){mode_str}")
         print("=" * 80)
         print()
     
@@ -286,7 +306,7 @@ Note: Some systems may require sudo/root privileges to read all process informat
             print(f"Error: {e}")
             sys.exit(1)
     
-    def run_once_with_ptime(self, uptime: float):
+    def run_once_with_uptime(self, uptime: float):
         start_time = time.time()
         processes = []
         proc_count = 0
@@ -333,10 +353,6 @@ Note: Some systems may require sudo/root privileges to read all process informat
         
         self.previous_uptime = uptime
     
-    def run_once_with_uptime(self, uptime: float):
-        # Alias for backward compatibility
-        self.run_once_with_ptime(uptime)
-    
     def scan_proc_directory(self) -> Optional[List[int]]:
         try:
             pids = []
@@ -348,7 +364,6 @@ Note: Some systems may require sudo/root privileges to read all process informat
             return None
     
     def read_process(self, pid: int, uptime: float, interval: float) -> Optional[ProcessInfo]:
-        _ = uptime  # Not used
         stat_path = f"/proc/{pid}/stat"
         try:
             with open(stat_path, 'r') as f:
@@ -391,7 +406,6 @@ Note: Some systems may require sudo/root privileges to read all process informat
             actual_interval = time.time() - previous_timestamp
             
             if actual_interval > 0:
-                # Convert clock ticks to seconds, then calculate percentage
                 time_diff_seconds = (total_time - previous_total_time) / self.hertz
                 cpu_usage = 100.0 * (time_diff_seconds / actual_interval)
             else:
@@ -449,7 +463,6 @@ Note: Some systems may require sudo/root privileges to read all process informat
         return threads
     
     def read_thread(self, pid: int, tid: int, uptime: float, interval: float) -> Optional[ProcessInfo]:
-        _ = uptime  # Not used
         stat_path = f"/proc/{pid}/task/{tid}/stat"
         try:
             with open(stat_path, 'r') as f:
@@ -486,7 +499,6 @@ Note: Some systems may require sudo/root privileges to read all process informat
             actual_interval = time.time() - previous_timestamp
             
             if actual_interval > 0:
-                # Convert clock ticks to seconds, then calculate percentage
                 time_diff_seconds = (total_time - previous_total_time) / self.hertz
                 cpu_usage = 100.0 * (time_diff_seconds / actual_interval)
             else:
@@ -517,7 +529,17 @@ Note: Some systems may require sudo/root privileges to read all process informat
         try:
             with open(status_path, 'r') as f:
                 for line in f:
-                    if line.startswith('VmRSS:'):
+                    if self.use_vm_size and line.startswith('VmSize:'):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            try:
+                                mem = int(parts[1])
+                                if self.use_mb:
+                                    return mem / 1024.0
+                                return float(mem)
+                            except ValueError:
+                                pass
+                    elif not self.use_vm_size and line.startswith('VmRSS:'):
                         parts = line.split()
                         if len(parts) >= 2:
                             try:
@@ -595,7 +617,8 @@ Note: Some systems may require sudo/root privileges to read all process informat
         display_processes = processes[:display_count]
         
         memory_unit = "MB" if self.use_mb else "KB"
-        memory_label = f"MEM({memory_unit})"
+        memory_type = "VMSIZE" if self.use_vm_size else "MEM"
+        memory_label = f"{memory_type}({memory_unit})"
         
         print(f"{'PID':<6} {'CPU%':<6} {memory_label:<12} {'STATE':<6} {'COMMAND'}")
         print("-" * 80)
