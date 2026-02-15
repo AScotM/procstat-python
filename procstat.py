@@ -18,6 +18,9 @@ DEFAULT_MAX_PID_SCAN = 131072
 DEFAULT_THREAD_LIMIT = 1000
 DEFAULT_CMD_LENGTH = 80
 FLOAT_EPSILON = 0.00001
+MAX_PID = 65535
+STATS_CLEANUP_AGE = 60
+READ_BATCH_SIZE = 1000
 VALID_SORTS = ['cpu', 'mem', 'pid', 'command', 'time']
 
 class ProcessInfo:
@@ -51,7 +54,7 @@ class ProcStat:
         self.last_scan_time = 0.0
         self.initial_scan_complete = False
     
-    def parse_arguments(self):
+    def parse_arguments(self) -> None:
         parser = argparse.ArgumentParser(
             description='Process Monitor - Linux Process Statistics',
             add_help=True
@@ -92,11 +95,11 @@ class ProcStat:
         else:
             self.use_mb = True
     
-    def check_privileges(self):
+    def check_privileges(self) -> None:
         if os.geteuid() != 0:
             sys.stderr.write("Warning: Running without root privileges. Some processes may not be visible.\n")
     
-    def validate_options(self):
+    def validate_options(self) -> None:
         if self.sort not in VALID_SORTS:
             sys.stderr.write(f"Warning: Invalid sort option '{self.sort}'. Using 'cpu'.\n")
             self.sort = 'cpu'
@@ -117,7 +120,7 @@ class ProcStat:
             sys.stderr.write("Warning: Max scan must be between 100 and 1000000. Using default.\n")
             self.max_pid_scan = DEFAULT_MAX_PID_SCAN
     
-    def setup_resource_limits(self):
+    def setup_resource_limits(self) -> None:
         try:
             soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
             max_files = min(self.max_pid_scan * 3, hard)
@@ -133,7 +136,7 @@ class ProcStat:
             if self.verbose:
                 sys.stderr.write(f"Debug: Could not set CPU limit: {e}\n")
     
-    def validate_proc_filesystem(self):
+    def validate_proc_filesystem(self) -> None:
         if not os.path.exists('/proc') or not os.path.isdir('/proc'):
             raise RuntimeError('/proc filesystem not available or not mounted')
         
@@ -142,6 +145,24 @@ class ProcStat:
         
         if not os.access('/proc/uptime', os.R_OK):
             raise RuntimeError('/proc/uptime is not readable. Check permissions or run with sudo')
+    
+    def validate_proc_path(self, path: str) -> bool:
+        try:
+            resolved = os.path.realpath(path)
+            if not resolved.startswith('/proc/'):
+                return False
+            
+            parts = resolved.split('/')
+            if len(parts) < 3:
+                return False
+            
+            if not parts[2].isdigit():
+                return False
+            
+            pid = int(parts[2])
+            return 0 < pid <= MAX_PID
+        except (ValueError, OSError):
+            return False
     
     def get_uptime(self) -> float:
         try:
@@ -206,53 +227,62 @@ class ProcStat:
             sys.stderr.write(f"Debug: Using default HERTZ value: {DEFAULT_HERTZ}\n")
         return DEFAULT_HERTZ
     
-    def run(self):
+    def run(self) -> None:
         if self.watch:
             self.run_watch_mode()
         else:
             self.run_once()
     
-    def run_watch_mode(self):
+    def run_watch_mode(self) -> None:
+        original_handlers = {
+            signal.SIGINT: signal.getsignal(signal.SIGINT),
+            signal.SIGTERM: signal.getsignal(signal.SIGTERM)
+        }
+        
         self.setup_signal_handlers()
         
-        print(f"Process Monitor - Refresh every {self.interval}s (Ctrl+C to stop)")
-        
-        iteration = 0
-        while not self.shutdown_requested:
-            if iteration > 0:
-                print("\033[2J\033[;H", end='')
+        try:
+            print(f"Process Monitor - Refresh every {self.interval}s (Ctrl+C to stop)")
             
-            try:
-                uptime = self.get_uptime()
-                self.display_header(iteration, uptime)
-                self.run_once_with_uptime(uptime)
-            except RuntimeError as e:
-                print(f"Error: {e}")
-                self.shutdown_requested = True
-                break
+            iteration = 0
+            while not self.shutdown_requested:
+                if iteration > 0:
+                    print("\033[2J\033[;H", end='')
+                
+                try:
+                    uptime = self.get_uptime()
+                    self.display_header(iteration, uptime)
+                    self.run_once_with_uptime(uptime)
+                except RuntimeError as e:
+                    print(f"Error: {e}")
+                    self.shutdown_requested = True
+                    break
+                
+                iteration += 1
+                self.sleep_with_interrupt(self.interval)
             
-            iteration += 1
-            self.sleep_with_interrupt(self.interval)
-        
-        print("\nShutting down...")
+            print("\nShutting down...")
+        finally:
+            signal.signal(signal.SIGINT, original_handlers[signal.SIGINT])
+            signal.signal(signal.SIGTERM, original_handlers[signal.SIGTERM])
     
-    def setup_signal_handlers(self):
+    def setup_signal_handlers(self) -> None:
         signal.signal(signal.SIGINT, self.handle_signal)
         signal.signal(signal.SIGTERM, self.handle_signal)
         if hasattr(signal, 'SIGHUP'):
             signal.signal(signal.SIGHUP, self.handle_signal)
     
-    def handle_signal(self, signum, frame):
+    def handle_signal(self, signum, frame) -> None:
         self.shutdown_requested = True
     
-    def sleep_with_interrupt(self, seconds: int):
+    def sleep_with_interrupt(self, seconds: int) -> None:
         remaining = seconds
         while remaining > 0 and not self.shutdown_requested:
             sleep_time = min(remaining, 1)
             time.sleep(sleep_time)
             remaining -= sleep_time
     
-    def display_header(self, iteration: int, uptime: float):
+    def display_header(self, iteration: int, uptime: float) -> None:
         memory_unit = "MB" if self.use_mb else "KB"
         memory_type = "VmSize" if self.use_vm_size else "VmRSS"
         uptime_str = self.format_uptime(uptime)
@@ -273,7 +303,7 @@ class ProcStat:
         print("=" * 80)
         print()
     
-    def run_once(self):
+    def run_once(self) -> None:
         try:
             if self.watch:
                 time.sleep(0.1)
@@ -286,7 +316,16 @@ class ProcStat:
             print(f"Error: {e}")
             sys.exit(1)
     
-    def run_once_with_uptime(self, uptime: float):
+    def cleanup_old_stats(self) -> None:
+        current_time = time.time()
+        expired_keys = []
+        for key, stat in self.previous_stats.items():
+            if current_time - stat['timestamp'] > STATS_CLEANUP_AGE:
+                expired_keys.append(key)
+        for key in expired_keys:
+            del self.previous_stats[key]
+    
+    def run_once_with_uptime(self, uptime: float) -> None:
         start_time = time.time()
         processes = []
         proc_count = 0
@@ -298,14 +337,18 @@ class ProcStat:
             return
         
         current_scan_time = time.time()
+        self.cleanup_old_stats()
         
-        for pid in pids:
+        for i, pid in enumerate(pids):
             proc_count += 1
             
             if proc_count > self.max_pid_scan:
                 if self.verbose:
                     sys.stderr.write(f"Warning: Too many processes, stopping scan at {proc_count}\n")
                 break
+            
+            if i > 0 and i % READ_BATCH_SIZE == 0:
+                time.sleep(0.001)
             
             process_info = self.read_process(pid, uptime)
             if process_info is not None:
@@ -340,13 +383,19 @@ class ProcStat:
             pids = []
             for entry in os.listdir('/proc'):
                 if entry.isdigit():
-                    pids.append(int(entry))
+                    pid = int(entry)
+                    if 0 < pid <= MAX_PID:
+                        pids.append(pid)
             return pids
         except (OSError, PermissionError):
             return None
     
     def read_process(self, pid: int, uptime: float) -> Optional[ProcessInfo]:
         stat_path = f"/proc/{pid}/stat"
+        
+        if not self.validate_proc_path(stat_path):
+            return None
+        
         try:
             with open(stat_path, 'r') as f:
                 content = f.read().strip()
@@ -384,24 +433,15 @@ class ProcStat:
         previous_key = f"{pid}_process"
         previous_stat = self.previous_stats.get(previous_key)
         
-        cpu_usage = 0.0
-        
-        if previous_stat and self.initial_scan_complete:
-            previous_total_time = previous_stat['total_time']
-            previous_timestamp = previous_stat['timestamp']
-            actual_interval = current_time - previous_timestamp
-            
-            if actual_interval > MIN_UPTIME:
-                time_diff_seconds = (total_time - previous_total_time) / self.hertz
-                cpu_usage = 100.0 * (time_diff_seconds / actual_interval)
-                if cpu_usage < 0:
-                    cpu_usage = 0.0
-        elif not self.watch or not self.initial_scan_complete:
-            process_start = start_time / self.hertz
-            process_lifetime = uptime - process_start
-            
-            if process_lifetime > MIN_UPTIME:
-                cpu_usage = 100.0 * (total_time / self.hertz) / process_lifetime
+        cpu_usage = self.calculate_cpu_usage(
+            total_time, 
+            previous_stat['total_time'] if previous_stat else None,
+            previous_stat['timestamp'] if previous_stat else None,
+            current_time,
+            uptime,
+            start_time,
+            self.initial_scan_complete
+        )
         
         self.previous_stats[previous_key] = {
             'total_time': total_time,
@@ -421,6 +461,25 @@ class ProcStat:
             ptime=round(total_time / self.hertz, 1),
             ptype='process'
         )
+    
+    def calculate_cpu_usage(self, total_time: float, previous_total_time: Optional[float], 
+                           previous_timestamp: Optional[float], current_time: float,
+                           uptime: float, start_time: float, initial_scan_complete: bool) -> float:
+        if previous_total_time is not None and previous_timestamp is not None and initial_scan_complete:
+            actual_interval = current_time - previous_timestamp
+            if actual_interval > MIN_UPTIME:
+                time_diff_seconds = (total_time - previous_total_time) / self.hertz
+                cpu_usage = 100.0 * (time_diff_seconds / actual_interval)
+                return max(0.0, min(100.0, cpu_usage))
+        elif not self.watch or not initial_scan_complete:
+            process_start = start_time / self.hertz
+            process_lifetime = uptime - process_start
+            
+            if process_lifetime > MIN_UPTIME:
+                cpu_usage = 100.0 * (total_time / self.hertz) / process_lifetime
+                return max(0.0, min(100.0, cpu_usage))
+        
+        return 0.0
     
     def read_threads(self, pid: int, uptime: float) -> List[ProcessInfo]:
         threads = []
@@ -454,6 +513,10 @@ class ProcStat:
     
     def read_thread(self, pid: int, tid: int, uptime: float) -> Optional[ProcessInfo]:
         stat_path = f"/proc/{pid}/task/{tid}/stat"
+        
+        if not self.validate_proc_path(stat_path):
+            return None
+        
         try:
             with open(stat_path, 'r') as f:
                 content = f.read().strip()
@@ -485,38 +548,29 @@ class ProcStat:
         previous_key = f"{pid}_{tid}_thread"
         previous_stat = self.previous_stats.get(previous_key)
         
-        cpu_usage = 0.0
-        
-        if previous_stat and self.initial_scan_complete:
-            previous_total_time = previous_stat['total_time']
-            previous_timestamp = previous_stat['timestamp']
-            actual_interval = current_time - previous_timestamp
-            
-            if actual_interval > MIN_UPTIME:
-                time_diff_seconds = (total_time - previous_total_time) / self.hertz
-                cpu_usage = 100.0 * (time_diff_seconds / actual_interval)
-                if cpu_usage < 0:
-                    cpu_usage = 0.0
-        elif not self.watch or not self.initial_scan_complete:
-            process_start = start_time / self.hertz
-            process_lifetime = uptime - process_start
-            
-            if process_lifetime > MIN_UPTIME:
-                cpu_usage = 100.0 * (total_time / self.hertz) / process_lifetime
+        cpu_usage = self.calculate_cpu_usage(
+            total_time, 
+            previous_stat['total_time'] if previous_stat else None,
+            previous_stat['timestamp'] if previous_stat else None,
+            current_time,
+            uptime,
+            start_time,
+            self.initial_scan_complete
+        )
         
         self.previous_stats[previous_key] = {
             'total_time': total_time,
             'timestamp': current_time
         }
         
-        memory = self.get_memory_usage(tid)
+        memory = self.get_memory_usage(pid)
         
         return ProcessInfo(
             pid=tid,
             ppid=pid,
             cpu=round(cpu_usage, 1),
             memory=round(memory, 1),
-            command=f"└─ {self.sanitize_output(name)}",
+            command=f"  └─ {self.sanitize_output(name)}",
             state=state,
             ptime=round(total_time / self.hertz, 1),
             ptype='thread'
@@ -524,6 +578,10 @@ class ProcStat:
     
     def get_memory_usage(self, pid: int) -> float:
         status_path = f"/proc/{pid}/status"
+        
+        if not self.validate_proc_path(status_path):
+            return 0.0
+        
         try:
             with open(status_path, 'r') as f:
                 for line in f:
@@ -554,6 +612,10 @@ class ProcStat:
     
     def get_process_command(self, pid: int, default_name: str) -> str:
         cmdline_path = f"/proc/{pid}/cmdline"
+        
+        if not self.validate_proc_path(cmdline_path):
+            return f"[{self.sanitize_output(default_name)}]"
+        
         try:
             with open(cmdline_path, 'rb') as f:
                 content = f.read()
@@ -593,7 +655,7 @@ class ProcStat:
             return text
         return text[:max_length - 3] + '...'
     
-    def render(self, processes: List[ProcessInfo]):
+    def render(self, processes: List[ProcessInfo]) -> None:
         if not processes:
             print("No processes found or insufficient permissions.")
             if os.geteuid() != 0:
@@ -636,7 +698,7 @@ class ProcStat:
             print("-" * 80)
             print(f"Top {display_count} processes: {total_cpu:.1f}% CPU, {total_mem:.1f} {memory_unit}")
 
-def main():
+def main() -> None:
     try:
         proc_stat = ProcStat()
         proc_stat.run()
