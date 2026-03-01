@@ -7,8 +7,9 @@ import signal
 import argparse
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import resource
+from functools import lru_cache
 
 DEFAULT_HERTZ = 100.0
 MIN_UPTIME = 0.1
@@ -21,6 +22,7 @@ FLOAT_EPSILON = 0.00001
 MAX_PID = 65535
 STATS_CLEANUP_AGE = 60
 READ_BATCH_SIZE = 1000
+CACHE_TTL = 1.0
 VALID_SORTS = ['cpu', 'mem', 'pid', 'command', 'time']
 
 class ProcessInfo:
@@ -50,6 +52,8 @@ class ProcStat:
         
         self.shutdown_requested = False
         self.previous_stats: Dict[str, Dict[str, float]] = {}
+        self.memory_cache: Dict[str, Tuple[float, float]] = {}
+        self.thread_cache: Dict[str, Tuple[float, ProcessInfo]] = {}
         self.previous_uptime: Optional[float] = None
         self.last_scan_time = 0.0
         self.initial_scan_complete = False
@@ -71,11 +75,9 @@ class ProcStat:
         parser.add_argument('--kb', action='store_true', help='Show memory in kilobytes')
         parser.add_argument('--mb', action='store_true', help='Show memory in megabytes (default)')
         parser.add_argument('--vm-size', action='store_true', help='Use VmSize instead of VmRSS for memory')
+        parser.add_argument('--tree', action='store_true', help='Show process tree')
         
-        try:
-            args = parser.parse_args()
-        except SystemExit:
-            sys.exit(0)
+        args = parser.parse_args()
         
         self.limit = args.limit
         self.sort = args.sort
@@ -87,6 +89,7 @@ class ProcStat:
         self.thread_limit = args.thread_limit
         self.max_pid_scan = args.max_scan
         self.use_vm_size = args.vm_size
+        self.show_tree = args.tree
         
         if args.mb:
             self.use_mb = True
@@ -296,6 +299,8 @@ class ProcStat:
             modes.append('Threads')
         if self.use_vm_size:
             modes.append('VmSize')
+        if self.show_tree:
+            modes.append('Tree')
         
         mode_str = f" | Modes: {', '.join(modes)}" if modes else ""
         
@@ -324,6 +329,20 @@ class ProcStat:
                 expired_keys.append(key)
         for key in expired_keys:
             del self.previous_stats[key]
+        
+        expired_keys = []
+        for key, (timestamp, _) in self.memory_cache.items():
+            if current_time - timestamp > CACHE_TTL:
+                expired_keys.append(key)
+        for key in expired_keys:
+            del self.memory_cache[key]
+        
+        expired_keys = []
+        for key, (timestamp, _) in self.thread_cache.items():
+            if current_time - timestamp > CACHE_TTL:
+                expired_keys.append(key)
+        for key in expired_keys:
+            del self.thread_cache[key]
     
     def run_once_with_uptime(self, uptime: float) -> None:
         start_time = time.time()
@@ -368,7 +387,10 @@ class ProcStat:
         if self.verbose and not self.watch:
             sys.stderr.write(f"Debug: Scanned {proc_count} processes, {error_count} errors, took {execution_time:.2f}ms\n")
         
-        self.render(processes)
+        if self.show_tree:
+            self.render_tree(processes)
+        else:
+            self.render(processes)
         
         if not self.watch:
             print(f"\nTotal processes displayed: {len(processes)}")
@@ -471,6 +493,8 @@ class ProcStat:
                 time_diff_seconds = (total_time - previous_total_time) / self.hertz
                 cpu_usage = 100.0 * (time_diff_seconds / actual_interval)
                 return max(0.0, min(100.0, cpu_usage))
+            else:
+                return 0.0
         elif not self.watch or not initial_scan_complete:
             process_start = start_time / self.hertz
             process_lifetime = uptime - process_start
@@ -489,9 +513,13 @@ class ProcStat:
             return threads
         
         count = 0
+        current_time = time.time()
+        
         try:
             for entry in task_dir.iterdir():
                 if count >= self.thread_limit:
+                    if self.verbose:
+                        sys.stderr.write(f"Debug: Reached thread limit {self.thread_limit} for PID {pid}\n")
                     break
                 
                 try:
@@ -502,8 +530,18 @@ class ProcStat:
                 if tid == pid:
                     continue
                 
+                cache_key = f"{pid}_{tid}_thread"
+                
+                if cache_key in self.thread_cache:
+                    cache_time, cached_thread = self.thread_cache[cache_key]
+                    if current_time - cache_time < CACHE_TTL:
+                        threads.append(cached_thread)
+                        count += 1
+                        continue
+                
                 thread = self.read_thread(pid, tid, uptime)
                 if thread is not None:
+                    self.thread_cache[cache_key] = (current_time, thread)
                     threads.append(thread)
                     count += 1
         except (OSError, PermissionError):
@@ -577,6 +615,14 @@ class ProcStat:
         )
     
     def get_memory_usage(self, pid: int) -> float:
+        cache_key = f"mem_{pid}"
+        current_time = time.time()
+        
+        if cache_key in self.memory_cache:
+            cache_time, cached_memory = self.memory_cache[cache_key]
+            if current_time - cache_time < CACHE_TTL:
+                return cached_memory
+        
         status_path = f"/proc/{pid}/status"
         
         if not self.validate_proc_path(status_path):
@@ -590,9 +636,9 @@ class ProcStat:
                         if len(parts) >= 2:
                             try:
                                 mem = int(parts[1])
-                                if self.use_mb:
-                                    return mem / 1024.0
-                                return float(mem)
+                                memory = mem / 1024.0 if self.use_mb else float(mem)
+                                self.memory_cache[cache_key] = (current_time, memory)
+                                return memory
                             except ValueError:
                                 pass
                     elif not self.use_vm_size and line.startswith('VmRSS:'):
@@ -600,9 +646,9 @@ class ProcStat:
                         if len(parts) >= 2:
                             try:
                                 rss = int(parts[1])
-                                if self.use_mb:
-                                    return rss / 1024.0
-                                return float(rss)
+                                memory = rss / 1024.0 if self.use_mb else float(rss)
+                                self.memory_cache[cache_key] = (current_time, memory)
+                                return memory
                             except ValueError:
                                 return 0.0
         except (IOError, PermissionError):
@@ -623,16 +669,11 @@ class ProcStat:
             if not content:
                 return f"[{self.sanitize_output(default_name)}]"
             
-            parts = content.split(b'\x00')
-            cmd_parts = []
-            for part in parts:
-                if part:
-                    try:
-                        cmd_parts.append(part.decode('utf-8', errors='replace'))
-                    except UnicodeDecodeError:
-                        cmd_parts.append(part.decode('latin-1', errors='replace'))
+            try:
+                cmdline = content.decode('utf-8', errors='replace').replace('\x00', ' ').strip()
+            except UnicodeDecodeError:
+                cmdline = content.decode('latin-1', errors='replace').replace('\x00', ' ').strip()
             
-            cmdline = ' '.join(cmd_parts).strip()
             if not cmdline:
                 return f"[{self.sanitize_output(default_name)}]"
             
@@ -654,6 +695,68 @@ class ProcStat:
         if len(text) <= max_length:
             return text
         return text[:max_length - 3] + '...'
+    
+    def build_process_tree(self, processes: List[ProcessInfo]) -> Dict[int, List[ProcessInfo]]:
+        tree = {}
+        by_pid = {p.pid: p for p in processes}
+        
+        for proc in processes:
+            if proc.ppid in by_pid:
+                if proc.ppid not in tree:
+                    tree[proc.ppid] = []
+                tree[proc.ppid].append(proc)
+            else:
+                if 0 not in tree:
+                    tree[0] = []
+                tree[0].append(proc)
+        
+        return tree
+    
+    def render_tree_node(self, processes: List[ProcessInfo], tree: Dict[int, List[ProcessInfo]], 
+                        pid: int, prefix: str = "", is_last: bool = True) -> None:
+        for i, proc in enumerate(processes):
+            if proc.pid == pid:
+                is_last_proc = (i == len(processes) - 1)
+                
+                if pid == 0:
+                    connector = ""
+                elif is_last:
+                    connector = "    "
+                else:
+                    connector = "│   "
+                
+                children = tree.get(pid, [])
+                
+                if pid != 0:
+                    print(f"{prefix}{'└── ' if is_last_proc else '├── '}{proc.pid:<6} {proc.cpu:<6.1f} {proc.memory:<12.1f} {proc.state:<6} {proc.command}")
+                else:
+                    print(f"{proc.pid:<6} {proc.cpu:<6.1f} {proc.memory:<12.1f} {proc.state:<6} {proc.command}")
+                
+                if children:
+                    sorted_children = sorted(children, key=lambda x: (-x.cpu, x.pid))
+                    for j, child in enumerate(sorted_children):
+                        is_last_child = (j == len(sorted_children) - 1)
+                        new_prefix = prefix + (connector if pid != 0 else "")
+                        self.render_tree_node([child], tree, child.pid, new_prefix, is_last_child)
+                break
+    
+    def render_tree(self, processes: List[ProcessInfo]) -> None:
+        if not processes:
+            print("No processes found or insufficient permissions.")
+            if os.geteuid() != 0:
+                print("Try running with sudo for more complete results.")
+            return
+        
+        tree = self.build_process_tree(processes)
+        memory_unit = "MB" if self.use_mb else "KB"
+        memory_type = "VMSIZE" if self.use_vm_size else "MEM"
+        memory_label = f"{memory_type}({memory_unit})"
+        
+        print(f"{'PID':<6} {'CPU%':<6} {memory_label:<12} {'STATE':<6} {'COMMAND'}")
+        print("-" * 80)
+        
+        root_processes = sorted(tree.get(0, []), key=lambda x: (-x.cpu, x.pid))
+        self.render_tree_node(root_processes, tree, 0)
     
     def render(self, processes: List[ProcessInfo]) -> None:
         if not processes:
