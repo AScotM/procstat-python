@@ -19,7 +19,7 @@ DEFAULT_MAX_PID_SCAN = 131072
 DEFAULT_THREAD_LIMIT = 1000
 DEFAULT_CMD_LENGTH = 80
 FLOAT_EPSILON = 0.00001
-MAX_PID = 65535
+MAX_PID = 4194304
 STATS_CLEANUP_AGE = 60
 READ_BATCH_SIZE = 1000
 CACHE_TTL = 1.0
@@ -57,6 +57,20 @@ class ProcStat:
         self.previous_uptime: Optional[float] = None
         self.last_scan_time = 0.0
         self.initial_scan_complete = False
+        self.num_cores = self.detect_cpu_cores()
+    
+    def detect_cpu_cores(self) -> int:
+        try:
+            with open('/proc/cpuinfo', 'r') as f:
+                cores = 0
+                for line in f:
+                    if line.startswith('processor'):
+                        cores += 1
+            if cores > 0:
+                return cores
+        except (IOError, OSError):
+            pass
+        return 1
     
     def parse_arguments(self) -> None:
         parser = argparse.ArgumentParser(
@@ -149,7 +163,7 @@ class ProcStat:
         if not os.access('/proc/uptime', os.R_OK):
             raise RuntimeError('/proc/uptime is not readable. Check permissions or run with sudo')
     
-    def validate_proc_path(self, path: str) -> bool:
+    def validate_proc_path(self, path: str, expected_type: str = 'any') -> bool:
         try:
             resolved = os.path.realpath(path)
             if not resolved.startswith('/proc/'):
@@ -163,7 +177,15 @@ class ProcStat:
                 return False
             
             pid = int(parts[2])
-            return 0 < pid <= MAX_PID
+            if pid <= 0 or pid > MAX_PID:
+                return False
+            
+            if expected_type == 'process':
+                return len(parts) == 3 or (len(parts) == 4 and parts[3] in ['stat', 'status', 'cmdline'])
+            elif expected_type == 'thread':
+                return len(parts) >= 5 and parts[3] == 'task' and parts[4].isdigit()
+            
+            return True
         except (ValueError, OSError):
             return False
     
@@ -290,7 +312,7 @@ class ProcStat:
         memory_type = "VmSize" if self.use_vm_size else "VmRSS"
         uptime_str = self.format_uptime(uptime)
         
-        print(f"Process Monitor - Iteration #{iteration} - {time.strftime('%Y-%m-%d %H:%M:%S')} - Uptime: {uptime_str}")
+        print(f"Process Monitor - Iteration #{iteration} - {time.strftime('%Y-%m-%d %H:%M:%S')} - Uptime: {uptime_str} - Cores: {self.num_cores}")
         
         modes = []
         if self.zombie:
@@ -323,30 +345,45 @@ class ProcStat:
     
     def cleanup_old_stats(self) -> None:
         current_time = time.time()
-        expired_keys = []
-        for key, stat in self.previous_stats.items():
-            if current_time - stat['timestamp'] > STATS_CLEANUP_AGE:
-                expired_keys.append(key)
-        for key in expired_keys:
-            del self.previous_stats[key]
+        max_entries = self.max_pid_scan * 2
         
-        expired_keys = []
-        for key, (timestamp, _) in self.memory_cache.items():
-            if current_time - timestamp > CACHE_TTL:
-                expired_keys.append(key)
-        for key in expired_keys:
-            del self.memory_cache[key]
+        if len(self.previous_stats) > max_entries:
+            sorted_stats = sorted(
+                self.previous_stats.items(), 
+                key=lambda x: x[1].get('timestamp', 0)
+            )
+            remove_count = len(sorted_stats) // 4
+            for key, _ in sorted_stats[:remove_count]:
+                del self.previous_stats[key]
+        else:
+            expired_keys = [
+                key for key, stat in self.previous_stats.items()
+                if current_time - stat.get('timestamp', 0) > STATS_CLEANUP_AGE
+            ]
+            for key in expired_keys:
+                del self.previous_stats[key]
         
-        expired_keys = []
-        for key, (timestamp, _) in self.thread_cache.items():
-            if current_time - timestamp > CACHE_TTL:
-                expired_keys.append(key)
-        for key in expired_keys:
-            del self.thread_cache[key]
+        for cache in [self.memory_cache, self.thread_cache]:
+            if len(cache) > max_entries // 2:
+                sorted_items = sorted(
+                    cache.items(),
+                    key=lambda x: x[1][0] if isinstance(x[1], tuple) else 0
+                )
+                remove_count = len(sorted_items) // 4
+                for key, _ in sorted_items[:remove_count]:
+                    del cache[key]
+            else:
+                expired_keys = [
+                    key for key, (timestamp, _) in cache.items()
+                    if current_time - timestamp > CACHE_TTL
+                ]
+                for key in expired_keys:
+                    del cache[key]
     
     def run_once_with_uptime(self, uptime: float) -> None:
         start_time = time.time()
         processes = []
+        threads = []
         proc_count = 0
         error_count = 0
         
@@ -374,8 +411,8 @@ class ProcStat:
                 processes.append(process_info)
                 
                 if self.threads:
-                    threads = self.read_threads(pid, uptime)
-                    processes.extend(threads)
+                    thread_list = self.read_threads(pid, uptime, len(processes))
+                    threads.extend(thread_list)
             else:
                 error_count += 1
         
@@ -388,12 +425,14 @@ class ProcStat:
             sys.stderr.write(f"Debug: Scanned {proc_count} processes, {error_count} errors, took {execution_time:.2f}ms\n")
         
         if self.show_tree:
-            self.render_tree(processes)
+            self.render_tree(processes, threads)
         else:
-            self.render(processes)
+            self.render(processes + threads)
         
         if not self.watch:
             print(f"\nTotal processes displayed: {len(processes)}")
+            if self.threads:
+                print(f"Total threads displayed: {len(threads)}")
             if error_count > 0:
                 print(f"Note: {error_count} processes could not be read (permissions or terminated)")
         
@@ -415,7 +454,7 @@ class ProcStat:
     def read_process(self, pid: int, uptime: float) -> Optional[ProcessInfo]:
         stat_path = f"/proc/{pid}/stat"
         
-        if not self.validate_proc_path(stat_path):
+        if not self.validate_proc_path(stat_path, 'process'):
             return None
         
         try:
@@ -453,12 +492,15 @@ class ProcStat:
         current_time = time.time()
         
         previous_key = f"{pid}_process"
-        previous_stat = self.previous_stats.get(previous_key)
+        previous_stat = self.previous_stats.get(previous_key, {})
+        
+        prev_total_time = previous_stat.get('total_time') if previous_stat else None
+        prev_timestamp = previous_stat.get('timestamp') if previous_stat else None
         
         cpu_usage = self.calculate_cpu_usage(
             total_time, 
-            previous_stat['total_time'] if previous_stat else None,
-            previous_stat['timestamp'] if previous_stat else None,
+            prev_total_time,
+            prev_timestamp,
             current_time,
             uptime,
             start_time,
@@ -492,7 +534,7 @@ class ProcStat:
             if actual_interval > MIN_UPTIME:
                 time_diff_seconds = (total_time - previous_total_time) / self.hertz
                 cpu_usage = 100.0 * (time_diff_seconds / actual_interval)
-                return max(0.0, min(100.0, cpu_usage))
+                return max(0.0, cpu_usage)
             else:
                 return 0.0
         elif not self.watch or not initial_scan_complete:
@@ -501,11 +543,11 @@ class ProcStat:
             
             if process_lifetime > MIN_UPTIME:
                 cpu_usage = 100.0 * (total_time / self.hertz) / process_lifetime
-                return max(0.0, min(100.0, cpu_usage))
+                return max(0.0, cpu_usage)
         
         return 0.0
     
-    def read_threads(self, pid: int, uptime: float) -> List[ProcessInfo]:
+    def read_threads(self, pid: int, uptime: float, process_index: int) -> List[ProcessInfo]:
         threads = []
         task_dir = Path(f"/proc/{pid}/task")
         
@@ -514,6 +556,7 @@ class ProcStat:
         
         count = 0
         current_time = time.time()
+        thread_list = []
         
         try:
             for entry in task_dir.iterdir():
@@ -530,29 +573,32 @@ class ProcStat:
                 if tid == pid:
                     continue
                 
+                thread_list.append(tid)
+                count += 1
+            
+            total_threads = len(thread_list)
+            for idx, tid in enumerate(thread_list):
                 cache_key = f"{pid}_{tid}_thread"
                 
                 if cache_key in self.thread_cache:
                     cache_time, cached_thread = self.thread_cache[cache_key]
                     if current_time - cache_time < CACHE_TTL:
                         threads.append(cached_thread)
-                        count += 1
                         continue
                 
-                thread = self.read_thread(pid, tid, uptime)
+                thread = self.read_thread(pid, tid, uptime, idx, total_threads)
                 if thread is not None:
                     self.thread_cache[cache_key] = (current_time, thread)
                     threads.append(thread)
-                    count += 1
         except (OSError, PermissionError):
             pass
         
         return threads
     
-    def read_thread(self, pid: int, tid: int, uptime: float) -> Optional[ProcessInfo]:
+    def read_thread(self, pid: int, tid: int, uptime: float, thread_num: int = 0, total_threads: int = 0) -> Optional[ProcessInfo]:
         stat_path = f"/proc/{pid}/task/{tid}/stat"
         
-        if not self.validate_proc_path(stat_path):
+        if not self.validate_proc_path(stat_path, 'thread'):
             return None
         
         try:
@@ -584,12 +630,15 @@ class ProcStat:
         current_time = time.time()
         
         previous_key = f"{pid}_{tid}_thread"
-        previous_stat = self.previous_stats.get(previous_key)
+        previous_stat = self.previous_stats.get(previous_key, {})
+        
+        prev_total_time = previous_stat.get('total_time') if previous_stat else None
+        prev_timestamp = previous_stat.get('timestamp') if previous_stat else None
         
         cpu_usage = self.calculate_cpu_usage(
             total_time, 
-            previous_stat['total_time'] if previous_stat else None,
-            previous_stat['timestamp'] if previous_stat else None,
+            prev_total_time,
+            prev_timestamp,
             current_time,
             uptime,
             start_time,
@@ -603,12 +652,17 @@ class ProcStat:
         
         memory = self.get_memory_usage(pid)
         
+        if thread_num == total_threads - 1:
+            prefix = "    └─ "
+        else:
+            prefix = "    ├─ "
+        
         return ProcessInfo(
             pid=tid,
             ppid=pid,
             cpu=round(cpu_usage, 1),
             memory=round(memory, 1),
-            command=f"  └─ {self.sanitize_output(name)}",
+            command=f"{prefix}[{self.sanitize_output(name)}]",
             state=state,
             ptime=round(total_time / self.hertz, 1),
             ptype='thread'
@@ -625,7 +679,7 @@ class ProcStat:
         
         status_path = f"/proc/{pid}/status"
         
-        if not self.validate_proc_path(status_path):
+        if not self.validate_proc_path(status_path, 'process'):
             return 0.0
         
         try:
@@ -659,7 +713,7 @@ class ProcStat:
     def get_process_command(self, pid: int, default_name: str) -> str:
         cmdline_path = f"/proc/{pid}/cmdline"
         
-        if not self.validate_proc_path(cmdline_path):
+        if not self.validate_proc_path(cmdline_path, 'process'):
             return f"[{self.sanitize_output(default_name)}]"
         
         try:
@@ -713,34 +767,41 @@ class ProcStat:
         return tree
     
     def render_tree_node(self, processes: List[ProcessInfo], tree: Dict[int, List[ProcessInfo]], 
-                        pid: int, prefix: str = "", is_last: bool = True) -> None:
+                        pid: int, prefix: str = "", is_last: bool = True, level: int = 0) -> None:
         for i, proc in enumerate(processes):
             if proc.pid == pid:
                 is_last_proc = (i == len(processes) - 1)
                 
                 if pid == 0:
                     connector = ""
-                elif is_last:
-                    connector = "    "
+                    current_prefix = ""
                 else:
-                    connector = "│   "
+                    if level > 1:
+                        current_prefix = prefix + ("    " if is_last else "│   ")
+                    else:
+                        current_prefix = prefix
+                    
+                    if is_last_proc:
+                        print(f"{current_prefix}└── ", end="")
+                    else:
+                        print(f"{current_prefix}├── ", end="")
+                
+                print(f"{proc.pid:<6} {proc.cpu:<6.1f} {proc.memory:<12.1f} {proc.state:<6} {proc.command}")
                 
                 children = tree.get(pid, [])
-                
-                if pid != 0:
-                    print(f"{prefix}{'└── ' if is_last_proc else '├── '}{proc.pid:<6} {proc.cpu:<6.1f} {proc.memory:<12.1f} {proc.state:<6} {proc.command}")
-                else:
-                    print(f"{proc.pid:<6} {proc.cpu:<6.1f} {proc.memory:<12.1f} {proc.state:<6} {proc.command}")
-                
                 if children:
                     sorted_children = sorted(children, key=lambda x: (-x.cpu, x.pid))
                     for j, child in enumerate(sorted_children):
                         is_last_child = (j == len(sorted_children) - 1)
-                        new_prefix = prefix + (connector if pid != 0 else "")
-                        self.render_tree_node([child], tree, child.pid, new_prefix, is_last_child)
+                        if pid == 0:
+                            new_prefix = ""
+                        else:
+                            new_prefix = current_prefix + ("    " if is_last_proc else "│   ")
+                        
+                        self.render_tree_node([child], tree, child.pid, new_prefix, is_last_child, level + 1)
                 break
     
-    def render_tree(self, processes: List[ProcessInfo]) -> None:
+    def render_tree(self, processes: List[ProcessInfo], threads: List[ProcessInfo]) -> None:
         if not processes:
             print("No processes found or insufficient permissions.")
             if os.geteuid() != 0:
@@ -756,7 +817,15 @@ class ProcStat:
         print("-" * 80)
         
         root_processes = sorted(tree.get(0, []), key=lambda x: (-x.cpu, x.pid))
-        self.render_tree_node(root_processes, tree, 0)
+        for proc in root_processes:
+            self.render_tree_node([proc], tree, proc.pid, "", True, 0)
+            
+            if self.threads:
+                process_threads = [t for t in threads if t.ppid == proc.pid]
+                if process_threads:
+                    sorted_threads = sorted(process_threads, key=lambda x: (-x.cpu, x.pid))
+                    for thread in sorted_threads:
+                        print(f"    {thread.pid:<6} {thread.cpu:<6.1f} {thread.memory:<12.1f} {thread.state:<6} {thread.command}")
     
     def render(self, processes: List[ProcessInfo]) -> None:
         if not processes:
