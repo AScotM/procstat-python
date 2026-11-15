@@ -16,8 +16,8 @@ It is intended for experiments, diagnosis, and terminal-based exploration of pro
 ## Installation
 
 ```bash
-mkdir -p ~/garage/procstat-python
-cd ~/garage/procstat-python
+mkdir -p ~/path/procstat-python
+cd ~/path/procstat-python
 cp /path/to/main.py .
 chmod +x main.py
 python3 main.py --help
