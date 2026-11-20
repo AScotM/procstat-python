@@ -12,7 +12,7 @@ import signal
 import sys
 import time
 
-VERSION = '3.0.0'
+VERSION = '3.1.0'
 STATES = {'R':'running','S':'sleeping','D':'disk-sleep','Z':'zombie','T':'stopped','t':'tracing','X':'dead','I':'idle','P':'parked'}
 PALETTES = {'ocean':((49,208,226),(80,126,245)), 'ember':((255,194,83),(240,78,101)), 'violet':((185,130,255),(75,210,240)), 'forest':((95,220,150),(60,145,180)), 'aurora':((42,235,183),(189,100,255)), 'solar':((255,210,74),(255,75,111)), 'ice':((120,220,255),(82,110,250)), 'mono':((210,210,210),(100,100,100)), 'hearth':((255,191,145),(173,121,161)), 'lantern':((255,208,130),(145,170,147)), 'dusk':((209,165,197),(110,148,178)), 'cocoa':((214,176,146),(154,129,122)), 'moss':((178,201,146),(120,151,143)), 'rosewood':((239,161,158),(162,126,162))}
 
@@ -114,7 +114,7 @@ class Collector:
         self.cmd_length=cmd_length; self.io=io
         self.hz=os.sysconf('SC_CLK_TCK'); self.page=os.sysconf('SC_PAGE_SIZE')
         self.cores=cpu_count(root)
-        self.prev={}; self.last_mono=None; self.previous_pids={}; self.generation=0
+        self.prev={}; self.last_mono=None; self.previous_pids={}; self.generation=0; self.baselined=False; self._elapsed=0.0
 
     def process(self,pid,tid=None):
         base=os.path.join(self.root,str(pid))
@@ -131,25 +131,29 @@ class Collector:
         rss=kb_field(status,'VmRSS') or stat['rss_pages']*self.page
         vsize=kb_field(status,'VmSize') or stat['vsize']
         io=io_fields(read_text(os.path.join(base,'io'))) if self.io else {}
-        ctx_vol=int(status.get('voluntary_ctxt_switches','0') or 0)
-        ctx_invol=int(status.get('nonvoluntary_ctxt_switches','0') or 0)
+        try: ctx_vol=int(status.get('voluntary_ctxt_switches','0') or 0)
+        except ValueError: ctx_vol=0
+        try: ctx_invol=int(status.get('nonvoluntary_ctxt_switches','0') or 0)
+        except ValueError: ctx_invol=0
         key=(pid,tid or pid,stat['start_ticks'])
         total=stat['utime']+stat['stime']
         old=self.prev.get(key)
         cpu=0.0
-        if old and self.last_mono is not None:
+        lifetime_cpu=0.0
+        if self._uptime is not None:
+            lifetime=self._uptime-stat['start_ticks']/self.hz
+            lifetime_cpu=max(0.0,100*total/self.hz/lifetime) if lifetime>0.1 else 0.0
+        if old is not None and self.last_mono is not None:
             elapsed=self._elapsed
             cpu=max(0.0,100*(total-old['ticks'])/self.hz/elapsed) if elapsed>0 else 0.0
-        elif self._uptime is not None:
-            lifetime=self._uptime-stat['start_ticks']/self.hz
-            cpu=max(0.0,100*total/self.hz/lifetime) if lifetime>0.1 else 0.0
         self._current[key]={'ticks':total,'io':io,'ctx':ctx_vol+ctx_invol}
-        delta_io={k:max(0,v-old['io'].get(k,0)) for k,v in io.items()} if old else {}
+        delta_io={k:max(0,v-old['io'][k]) for k,v in io.items() if old is not None and k in old['io'] and v>=old['io'][k]}
+        io_rate={k:round(v/self._elapsed,2) for k,v in delta_io.items()} if self._elapsed>0 else {}
         return {'pid':stat['pid'],'tgid':pid,'ppid':stat['ppid'] if tid is None else pid,'type':'thread' if tid is not None else 'process',
-                'name':name,'comm':safe(stat['comm']),'state':stat['state'],'cpu':round(cpu,2),'cpu_seconds':round(total/self.hz,3),
+                'name':name,'comm':safe(stat['comm']),'state':stat['state'],'cpu':round(cpu,2),'cpu_lifetime':round(lifetime_cpu,2),'cpu_sampled':old is not None and self.last_mono is not None,'cpu_seconds':round(total/self.hz,3),
                 'rss':rss,'vsize':vsize,'memory':vsize if self.vm_size else rss,'threads':stat['threads'],
                 'priority':stat['priority'],'nice':stat['nice'],'processor':stat['processor'],'start_ticks':stat['start_ticks'],
-                'identity':f"{pid}:{tid or pid}:{stat['start_ticks']}",'io':io,'io_delta':delta_io,
+                'identity':f"{pid}:{tid or pid}:{stat['start_ticks']}",'io':io,'io_delta':delta_io,'io_rate':io_rate,
                 'ctx_voluntary':ctx_vol,'ctx_involuntary':ctx_invol,'ctx_delta':max(0,ctx_vol+ctx_invol-old['ctx']) if old else 0}
 
     def scan(self):
@@ -171,13 +175,14 @@ class Collector:
                     t=self.process(pid,tid)
                     if t is not None: records.append(t)
         identities={p['pid']:p['start_ticks'] for p in records if p['type']=='process'}
-        births=[pid for pid,start_tick in identities.items() if self.previous_pids.get(pid)!=start_tick]
-        exits=[pid for pid in self.previous_pids if pid not in identities]
-        reused=[pid for pid,start_tick in identities.items() if pid in self.previous_pids and self.previous_pids[pid]!=start_tick]
-        self.previous_pids=identities; self.prev=self._current; self.last_mono=start; self.generation+=1
+        births=[pid for pid,start_tick in identities.items() if pid not in self.previous_pids] if self.baselined else []
+        exits=[pid for pid in self.previous_pids if pid not in identities] if self.baselined else []
+        reused=[pid for pid,start_tick in identities.items() if pid in self.previous_pids and self.previous_pids[pid]!=start_tick] if self.baselined else []
+        births.extend(reused)
+        self.previous_pids=identities; self.prev=self._current; self.last_mono=start; self.generation+=1; self.baselined=True
         processes=[p for p in records if p['type']=='process']
         return {'schema':'procstat-python/v2','timestamp':iso_now(),'generation':self.generation,'uptime':self._uptime,
-                'cores':self.cores,'clock_ticks':self.hz,'scan_seconds':round(time.monotonic()-start,4),'errors':errors,
+                'cores':self.cores,'clock_ticks':self.hz,'scan_seconds':round(time.monotonic()-start,4),'sample_seconds':round(self._elapsed,4),'errors':errors,
                 'count':len(processes),'thread_rows':len(records)-len(processes),'births':births,'exits':exits,'pid_reuse':reused,
                 'total_rss':sum(p['rss'] for p in processes),'total_cpu':round(sum(p['cpu'] for p in processes),2),'records':records,'system':read_system(self.root)}
 
@@ -329,7 +334,7 @@ def io_view(snapshot,args):
     for p in rows:
         io=p['io']; delta=p['io_delta']
         print(f"{p['pid']:8} {paint(f"{size_fmt(delta.get('read_bytes',0)):>12}",args,0.7)} {paint(f"{size_fmt(delta.get('write_bytes',0)):>12}",args,0.3)} {size_fmt(io.get('read_bytes',0)):>13} {size_fmt(io.get('write_bytes',0)):>13}  {p['name'][:50]}")
-    print('\n  I/O deltas require consecutive samples; the first sample reports zero deltas')
+    print('\n  I/O deltas require consecutive samples; the first sample has no I/O baseline')
 
 def state_view(snapshot,args):
     headline('SCHEDULER STATE DISTRIBUTION',snapshot,args)
@@ -408,14 +413,14 @@ def diff_snapshots(before,after,args):
         a=old.get(key); b=new.get(key)
         rows.append({'pid':(b or a)['pid'],'name':(b or a)['name'],'status':'new' if a is None else 'exited' if b is None else 'persisting',
                      'rss_delta':(b['rss'] if b else 0)-(a['rss'] if a else 0),
-                     'cpu_seconds_delta':round((b['cpu_seconds'] if b else 0)-(a['cpu_seconds'] if a else 0),3),
+                     'cpu_seconds_delta':round(max(0,b['cpu_seconds']-a['cpu_seconds']),3) if a and b else None,
                      'threads_delta':(b['threads'] if b else 0)-(a['threads'] if a else 0)})
     rows.sort(key=lambda r:(-abs(r['rss_delta']),r['pid']))
     if args.format=='json': print(json.dumps({'schema':'procstat-python/diff-v1','before':before.get('timestamp'),'after':after.get('timestamp'),'rows':rows},indent=2)); return
     print(f"BASELINE DIFF  {before.get('timestamp','?')} → {after.get('timestamp','?')}")
     print(f"{'PID':>7} {'STATUS':<12} {'RSS DELTA':>14} {'CPU TIME Δ':>12} {'THR Δ':>7} NAME")
     for r in rows[:args.limit]:
-        print(f"{r['pid']:7} {r['status']:<12} {r['rss_delta']/1048576:+13.2f}M {r['cpu_seconds_delta']:+12.2f} {r['threads_delta']:+7} {r['name']}")
+        print(f"{r['pid']:7} {r['status']:<12} {r['rss_delta']/1048576:+13.2f}M {r['cpu_seconds_delta'] if r['cpu_seconds_delta'] is not None else 'N/A':>12} {r['threads_delta']:+7} {r['name']}")
 
 def load_snapshot(path):
     with open(path,encoding='utf-8') as f: data=json.load(f)
@@ -953,7 +958,7 @@ def parser_build():
     p.add_argument('--pid',type=int,help='Process ID for inspect')
     p.add_argument('--svg',help='Export cozy process atlas as SVG')
     p.add_argument('--markdown',help='Export a Markdown observation report')
-    p.add_argument('--no-io',action='store_true'); p.add_argument('--verbose',action='store_true')
+    p.add_argument('--lightweight',action='store_true',help='Skip per-process I/O reads for lower overhead'); p.add_argument('--no-io',action='store_true'); p.add_argument('--verbose',action='store_true')
     p.add_argument('--version',action='version',version=VERSION)
     return p
 
@@ -991,7 +996,7 @@ def main(argv=None):
     if args.command=='diff' and not args.baseline: p.error('diff requires --baseline')
     if args.command=='inspect' and (args.pid is None or args.pid<1): p.error('inspect requires --pid')
     if not os.path.isdir(args.proc_root): raise RuntimeError(f'proc root unavailable: {args.proc_root}')
-    collector=Collector(args.proc_root,args.threads,args.zombie,args.vm_size,args.max_scan,args.thread_limit,args.cmd_length,not args.no_io)
+    collector=Collector(args.proc_root,args.threads,args.zombie,args.vm_size,args.max_scan,args.thread_limit,args.cmd_length,not (args.no_io or args.lightweight))
     if args.command=='watch':
         stopped=False
         def stop(sig,frame):
